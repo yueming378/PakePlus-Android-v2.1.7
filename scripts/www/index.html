@@ -1,11 +1,586 @@
-<!DOCTYPE html>
-<html lang="en">
-    <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <title>PakePlus</title>
-    </head>
-    <body>
-        PakePlus
-    </body>
-</html>
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  Timer, 
+  Calendar, 
+  Plus, 
+  Trash2, 
+  Gift, 
+  Clock, 
+  Play, 
+  X, 
+  TrendingUp,
+  Coffee,
+  Wrench,
+  ChevronRight,
+  Sparkles,
+  FastForward,
+  RotateCcw,
+  Star,
+  Check,
+  AlertCircle,
+  Bell,
+  Volume2,
+  Box,
+  Hourglass
+} from 'lucide-react';
+
+// --- 常量定义 ---
+const TOMATO_TYPES = {
+  SMALL: { id: 'SMALL', label: '小番茄', duration: 5, icon: '🍅', size: 'text-lg' },
+  MEDIUM: { id: 'MEDIUM', label: '中番茄', duration: 10, icon: '🍎', size: 'text-xl' },
+  LARGE: { id: 'LARGE', label: '大番茄', duration: 60, icon: '🍅', size: 'text-3xl' },
+  GREEN: { id: 'GREEN', label: '青番茄', duration: 30, icon: '🍏', size: 'text-xl' }
+};
+
+const DEFAULT_BLOCKS = [
+  { id: '1', name: '轻量家务', duration: 5, reward: 'SMALL', icon: '🏠' },
+  { id: '2', name: '深度学习', duration: 30, reward: 'LARGE', icon: '📚' },
+  { id: '3', name: '日常阅读', duration: 15, reward: 'MEDIUM', icon: '📖' },
+];
+
+const App = () => {
+  // --- 状态管理 ---
+  const [currentDate, setCurrentDate] = useState(new Date());
+  const [inventory, setInventory] = useState({ SMALL: 0, MEDIUM: 0, LARGE: 6 });
+  const [greenTomatoes, setGreenTomatoes] = useState(0); 
+  const [xp, setXp] = useState(0); 
+  const [blocks, setBlocks] = useState(DEFAULT_BLOCKS);
+  const [streak, setStreak] = useState(0);
+  const [lastCheckInDate, setLastCheckInDate] = useState(null);
+  const [checkInHistory, setCheckInHistory] = useState([]);
+  const [todayMinutes, setTodayMinutes] = useState(0); 
+  
+  const [activeTab, setActiveTab] = useState('home'); 
+  const [timerState, setTimerState] = useState({ running: false, mode: 'work', timeLeft: 0, currentBlock: null });
+  const [confirmModal, setConfirmModal] = useState({ show: false, type: null, data: null });
+  const [isPreparing, setIsPreparing] = useState(false);
+  const [prepCount, setPrepCount] = useState(3);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [showDebugMenu, setShowDebugMenu] = useState(false);
+  const [alarmActive, setAlarmActive] = useState(false);
+  const [alarmAutoStopTimer, setAlarmAutoStopTimer] = useState(30);
+  const [newBlock, setNewBlock] = useState({ name: '', duration: 25, reward: 'MEDIUM', icon: '✨' });
+
+  const audioCtx = useRef(null);
+  const melodyInterval = useRef(null);
+  const wakeLock = useRef(null);
+
+  // --- 衍生状态 ---
+  const level = Math.floor(xp / 10);
+  const formatDate = (date) => date.toISOString().split('T')[0];
+
+  // --- 辅助：格式化时间 ---
+  const formatTime = (seconds) => {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // --- 辅助：后台通知 ---
+  const sendSystemNotification = (title, body) => {
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification(title, { body, icon: "https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/1f43b.png" });
+    }
+  };
+
+  // --- 辅助：屏幕常亮 (Wake Lock API) ---
+  const requestWakeLock = async () => {
+    if ('wakeLock' in navigator) {
+      try {
+        wakeLock.current = await navigator.wakeLock.request('screen');
+      } catch (err) {
+        console.warn(`${err.name}, ${err.message}`);
+      }
+    }
+  };
+
+  const releaseWakeLock = () => {
+    if (wakeLock.current) {
+      wakeLock.current.release();
+      wakeLock.current = null;
+    }
+  };
+
+  // --- 欢快旋律系统 ---
+  const playNote = (freq, startTime, duration) => {
+    if (!audioCtx.current) audioCtx.current = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.current.createOscillator();
+    const gain = audioCtx.current.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(freq, startTime);
+    gain.gain.setValueAtTime(0, startTime);
+    gain.gain.linearRampToValueAtTime(0.08, startTime + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.01, startTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.current.destination);
+    osc.start(startTime);
+    osc.stop(startTime + duration);
+  };
+
+  const startMelody = () => {
+    const melody = [523.25, 659.25, 783.99, 1046.50, 783.99, 659.25];
+    let idx = 0;
+    if (!audioCtx.current) audioCtx.current = new (window.AudioContext || window.webkitAudioContext)();
+    melodyInterval.current = setInterval(() => {
+      const now = audioCtx.current.currentTime;
+      playNote(melody[idx % melody.length], now, 0.4);
+      idx++;
+    }, 500);
+  };
+
+  const stopMelody = () => {
+    if (melodyInterval.current) clearInterval(melodyInterval.current);
+    melodyInterval.current = null;
+  };
+
+  // --- 核心逻辑：计时器与浏览器标题同步 ---
+  useEffect(() => {
+    let interval = null;
+    if (timerState.running) {
+      requestWakeLock(); // 计时时保持屏幕常亮
+      document.title = `(${formatTime(timerState.timeLeft)}) 小熊番茄`;
+      interval = setInterval(() => {
+        if (timerState.mode === 'work' || timerState.mode === 'rest_fixed') {
+          if (timerState.timeLeft > 0) {
+            setTimerState(prev => ({ ...prev, timeLeft: prev.timeLeft - 1 }));
+          } else {
+            if (timerState.mode === 'work') handleTaskComplete();
+            else handleRestComplete();
+          }
+        } else if (timerState.mode === 'rest_pool') {
+          setTimerState(prev => ({ ...prev, timeLeft: prev.timeLeft + 1 }));
+        }
+      }, 1000);
+    } else {
+      document.title = "小熊番茄";
+      releaseWakeLock();
+    }
+    return () => {
+      clearInterval(interval);
+      releaseWakeLock();
+    };
+  }, [timerState.running, timerState.timeLeft]);
+
+  // --- 闹钟 30s 逻辑 ---
+  useEffect(() => {
+    let timer = null;
+    if (alarmActive) {
+      startMelody();
+      setAlarmAutoStopTimer(30);
+      timer = setInterval(() => {
+        setAlarmAutoStopTimer(prev => {
+          if (prev <= 1) {
+            setAlarmActive(false);
+            stopMelody();
+            clearInterval(timer);
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    } else {
+      stopMelody();
+    }
+    return () => clearInterval(timer);
+  }, [alarmActive]);
+
+  // --- 打卡逻辑 ---
+  useEffect(() => {
+    const todayStr = formatDate(currentDate);
+    if (todayMinutes >= 15 && lastCheckInDate !== todayStr) {
+      triggerCheckIn(todayStr);
+    }
+  }, [todayMinutes]);
+
+  const triggerCheckIn = (dateStr) => {
+    const yesterday = new Date(currentDate);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayStr = formatDate(yesterday);
+    const newStreak = (lastCheckInDate === yesterdayStr) ? streak + 1 : 1;
+    setStreak(newStreak);
+    setLastCheckInDate(dateStr);
+    setCheckInHistory(prev => [...prev, dateStr]);
+    setGreenTomatoes(prev => prev + 1);
+    if ([5, 6, 7].includes(newStreak)) setInventory(prev => ({ ...prev, LARGE: prev.LARGE + 1 }));
+    else if (newStreak === 15) setInventory(prev => ({ ...prev, LARGE: prev.LARGE + 2 }));
+    else if (newStreak === 30) setInventory(prev => ({ ...prev, LARGE: prev.LARGE + 10 }));
+    sendSystemNotification("🎉 今日行动已达标！", "小熊为你发放了今日打卡奖励和青番茄，继续保持哦！");
+  };
+
+  const handleTaskComplete = () => {
+    const block = timerState.currentBlock;
+    setTodayMinutes(prev => prev + block.duration);
+    addTomato(block.reward, 1);
+    setTimerState({ running: false, mode: 'work', timeLeft: 0, currentBlock: null });
+    setAlarmActive(true);
+    sendSystemNotification("🐻 专注任务完成！", `你完成了「${block.name}」，快回来开启奖励吧！`);
+  };
+
+  const handleRestComplete = () => {
+    setTimerState({ running: false, mode: 'work', timeLeft: 0, currentBlock: null });
+    setAlarmActive(true);
+    sendSystemNotification("⏰ 休息时间结束！", "番茄能量已充能完毕，准备好开始下一个专注了吗？");
+  };
+
+  const finishRestAndSettle = () => {
+    const minutesUsed = Math.ceil(timerState.timeLeft / 60);
+    if (minutesUsed <= 0) {
+      setTimerState({ running: false, mode: 'work', timeLeft: 0 });
+      return;
+    }
+    let remainingToPay = minutesUsed;
+    let newInv = { ...inventory };
+    while (remainingToPay > 0) {
+      if (newInv.LARGE > 0) { newInv.LARGE--; remainingToPay -= 60; }
+      else if (newInv.MEDIUM > 0) { newInv.MEDIUM--; remainingToPay -= 10; }
+      else if (newInv.SMALL > 0) { newInv.SMALL--; remainingToPay -= 5; }
+      else { remainingToPay = -Math.abs(remainingToPay); }
+    }
+    if (remainingToPay < 0) setXp(prev => prev + Math.abs(remainingToPay));
+    setInventory(newInv);
+    setTimerState({ running: false, mode: 'work', timeLeft: 0 });
+    setAlarmActive(true);
+    sendSystemNotification("☕ 休息结算完成", `本次休息消耗了 ${minutesUsed} 分钟，已扣除对应番茄。`);
+  };
+
+  const addTomato = (type, count) => {
+    if (type === 'GREEN') setGreenTomatoes(prev => prev + count);
+    else setInventory(prev => ({ ...prev, [type]: prev[type] + count }));
+  };
+
+  // --- 权限请求 ---
+  const requestStart = (type, data) => {
+    if ("Notification" in window && Notification.permission !== "denied") {
+      Notification.requestPermission();
+    }
+    
+    if (type === 'QUICK_REST') {
+      const hasStock = data === 'GREEN' ? greenTomatoes > 0 : inventory[data] > 0;
+      if (!hasStock) return;
+      setConfirmModal({ show: true, type: 'QUICK_REST', data: data });
+    } else if (type === 'REST_POOL') {
+      if (inventory.LARGE < 4) {
+        alert("⚠️ 休息室需要持有 4 个以上的大番茄才能开启哦！");
+        return;
+      }
+      setConfirmModal({ show: true, type: 'REST_POOL', data: null });
+    } else {
+      setConfirmModal({ show: true, type: 'WORK', data: data });
+    }
+  };
+
+  const confirmStart = () => {
+    const { type, data } = confirmModal;
+    setConfirmModal({ show: false, type: null, data: null });
+    if (type === 'WORK') {
+      setIsPreparing(true);
+      setPrepCount(3);
+      const target = data;
+      const countInterval = setInterval(() => {
+        setPrepCount(prev => {
+          if (prev <= 1) {
+            clearInterval(countInterval);
+            setIsPreparing(false);
+            setTimerState({ running: true, mode: 'work', timeLeft: target.duration * 60, currentBlock: target });
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    } else if (type === 'QUICK_REST') {
+      if (data === 'GREEN') setGreenTomatoes(prev => prev - 1);
+      else setInventory(prev => ({ ...prev, [data]: prev[data] - 1 }));
+      setTimerState({ 
+        running: true, mode: 'rest_fixed', 
+        timeLeft: TOMATO_TYPES[data].duration * 60, 
+        currentBlock: { name: `${TOMATO_TYPES[data].label}休息`, icon: TOMATO_TYPES[data].icon }
+      });
+    } else if (type === 'REST_POOL') {
+      setTimerState({ running: true, mode: 'rest_pool', timeLeft: 0, currentBlock: { name: '自由休息室', icon: '☕' } });
+    }
+  };
+
+  const debugTools = {
+    skipToEnd: () => { if (timerState.running) setTimerState(prev => ({ ...prev, timeLeft: 1 })); },
+    jumpDay: () => {
+      const tomorrow = new Date(currentDate); tomorrow.setDate(tomorrow.getDate() + 1);
+      setCurrentDate(tomorrow); setTodayMinutes(0); setGreenTomatoes(0);
+    }
+  };
+
+  return (
+    <div className="flex justify-center bg-gray-900 min-h-screen items-center">
+      {/* 手机外壳 */}
+      <div className="w-full max-w-md bg-orange-50 h-[844px] shadow-2xl relative overflow-hidden flex flex-col rounded-[50px] border-[8px] border-black">
+        
+        {/* 顶部状态栏 */}
+        <header className="bg-white p-6 pt-12 shadow-sm rounded-b-[40px] z-10 border-b-2 border-orange-100">
+          <div className="flex justify-between items-center mb-6">
+            <div className="flex items-center gap-3">
+              <div className="relative">
+                <div className="w-12 h-12 bg-orange-400 rounded-2xl flex items-center justify-center text-2xl shadow-inner border-2 border-orange-200">🐻</div>
+                <div className="absolute -bottom-1 -right-1 bg-yellow-400 text-white text-[8px] font-black w-5 h-5 rounded-full flex items-center justify-center border-2 border-white">LV{level}</div>
+              </div>
+              <h1 className="text-lg font-black text-orange-800 leading-tight">小熊番茄</h1>
+            </div>
+            <div className="text-right">
+              <div className="flex items-center gap-1 justify-end text-[9px] font-black text-orange-500 mb-1">
+                {todayMinutes >= 15 ? <Sparkles size={10}/> : <Hourglass size={10}/>}
+                打卡进度 {todayMinutes}/15m
+              </div>
+              <div className="h-1.5 w-24 bg-gray-100 rounded-full overflow-hidden">
+                <div className="h-full bg-orange-500 transition-all duration-700" style={{ width: `${Math.min(100, (todayMinutes/15)*100)}%` }}></div>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-4 gap-2">
+            {['SMALL', 'MEDIUM', 'LARGE', 'GREEN'].map(type => (
+              <button 
+                key={type} 
+                onClick={() => requestStart('QUICK_REST', type)}
+                className={`p-3 rounded-2xl text-center border active:scale-95 transition group ${type === 'GREEN' ? 'bg-green-50 border-green-100' : 'bg-gray-50 border-gray-100'}`}
+              >
+                <span className={`${TOMATO_TYPES[type].size} group-hover:scale-110 inline-block transition`}>{TOMATO_TYPES[type].icon}</span>
+                <p className={`text-[8px] mt-1 font-bold ${type === 'GREEN' ? 'text-green-600' : 'text-gray-400'}`}>{TOMATO_TYPES[type].label}</p>
+                <p className="font-black text-xs text-gray-700">{type === 'GREEN' ? greenTomatoes : inventory[type]}</p>
+              </button>
+            ))}
+          </div>
+        </header>
+
+        {/* 主内容 */}
+        <main className="flex-1 overflow-y-auto px-6 py-6 pb-48">
+          {timerState.running ? (
+            <div className={`bg-white p-10 rounded-[40px] shadow-xl text-center border-4 border-dashed ${timerState.mode === 'work' ? 'border-orange-100' : 'border-blue-100'} animate-in zoom-in-95 duration-300`}>
+              <div className={`mb-4 inline-block p-4 rounded-full ${timerState.mode === 'work' ? 'bg-orange-50 text-orange-500' : 'bg-blue-50 text-blue-500'}`}>
+                {timerState.mode === 'work' ? <Timer size={32} /> : <Coffee size={32} />}
+              </div>
+              <h2 className="text-xl font-black text-gray-700">{timerState.mode === 'work' ? '专注时间' : '休息时间'}</h2>
+              <p className="text-xs text-gray-400 mb-8">{timerState.currentBlock?.name}</p>
+              <div className={`text-7xl font-black mb-10 tabular-nums tracking-tighter ${timerState.mode === 'rest_pool' ? 'text-blue-500' : 'text-gray-800'}`}>
+                {formatTime(timerState.timeLeft)}
+              </div>
+              
+              {timerState.mode === 'rest_pool' ? (
+                <button onClick={finishRestAndSettle} className="w-full py-5 bg-blue-500 text-white rounded-3xl font-black shadow-lg flex items-center justify-center gap-2">
+                  <Check size={20} /> 结束休息结算
+                </button>
+              ) : (
+                <button onClick={() => setTimerState({...timerState, running: false})} className="w-full py-4 text-gray-300 font-bold hover:text-red-400 transition">放弃并返回</button>
+              )}
+            </div>
+          ) : (
+            <>
+              {activeTab === 'home' && (
+                <div className="space-y-6">
+                  <div className="flex justify-between items-center">
+                    <h3 className="font-black text-gray-700 flex items-center gap-2 text-sm uppercase tracking-wider"><Clock size={16} className="text-orange-500" /> 行动清单</h3>
+                    <button onClick={() => setShowAddModal(true)} className="p-2 bg-orange-500 rounded-full text-white shadow-lg active:scale-90 transition"><Plus size={18} /></button>
+                  </div>
+                  <div className="grid grid-cols-1 gap-4">
+                    {blocks.map(block => (
+                      <div key={block.id} className="bg-white p-4 rounded-3xl flex items-center gap-4 shadow-sm border-2 border-transparent hover:border-orange-200 transition group relative">
+                        <div className="text-3xl p-3 bg-orange-50 rounded-2xl">{block.icon}</div>
+                        <div className="flex-1">
+                          <h4 className="font-black text-gray-800">{block.name}</h4>
+                          <span className="text-[10px] text-gray-400 font-bold tracking-tight">⌛ {block.duration} min · 🎁 {TOMATO_TYPES[block.reward].label}</span>
+                        </div>
+                        <button onClick={() => requestStart('WORK', block)} className="w-12 h-12 bg-orange-500 rounded-2xl flex items-center justify-center text-white shadow-lg active:scale-90 transition"><Play size={20} fill="currentColor" /></button>
+                        <button onClick={() => setBlocks(blocks.filter(b => b.id !== block.id))} className="absolute top-2 right-2 p-1 text-gray-200 hover:text-red-400 transition opacity-0 group-hover:opacity-100">
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'shop' && (
+                <div className="space-y-6 text-center">
+                  <h3 className="font-black text-gray-700 flex items-center gap-2 text-left text-sm uppercase tracking-wider"><Coffee size={16} className="text-blue-500" /> 自由休息室</h3>
+                  <div className="bg-blue-50 p-10 rounded-[40px] border-2 border-blue-100 relative overflow-hidden">
+                    <div className="relative z-10">
+                      <p className="text-xs text-blue-400 font-bold mb-4 uppercase tracking-widest">开启门槛：4 个大番茄</p>
+                      <div className="flex justify-center items-end gap-2 mb-10">
+                        <span className="text-5xl font-black text-blue-600">{inventory.LARGE}</span>
+                        <span className="text-xl font-bold text-blue-300 mb-1">/ 4</span>
+                      </div>
+                      <button 
+                        disabled={inventory.LARGE < 4}
+                        onClick={() => requestStart('REST_POOL')}
+                        className={`w-full py-5 rounded-[24px] font-black shadow-xl transition-all ${inventory.LARGE >= 4 ? 'bg-blue-500 text-white hover:scale-105' : 'bg-gray-200 text-gray-400 scale-95'}`}
+                      >
+                        开启自由计时
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === 'calendar' && (
+                <div className="space-y-6">
+                  <div className="bg-white p-6 rounded-[40px] shadow-sm border-b-4 border-orange-100">
+                    <div className="flex justify-between items-center mb-6">
+                      <h3 className="font-black">打卡与成就</h3>
+                      <div className="bg-orange-500 text-white text-xs px-3 py-1 rounded-full font-black flex items-center gap-1"><TrendingUp size={12} /> {streak} 天连胜</div>
+                    </div>
+                    <div className="grid grid-cols-7 gap-2">
+                      {Array.from({ length: 21 }).map((_, i) => {
+                        const date = new Date(currentDate);
+                        date.setDate(date.getDate() - (20 - i));
+                        const dStr = formatDate(date);
+                        const isChecked = checkInHistory.includes(dStr);
+                        return (
+                          <div key={i} className={`aspect-square flex flex-col items-center justify-center rounded-2xl text-[10px] font-bold transition-all ${isChecked ? 'bg-orange-500 text-white shadow-inner scale-105' : 'bg-gray-50 text-gray-300'}`}>
+                            {date.getDate()}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </main>
+
+        {/* 底部导航 */}
+        <nav className="absolute bottom-10 left-6 right-6 bg-white/95 backdrop-blur shadow-2xl flex justify-around p-3 rounded-full z-20 border-2 border-orange-100">
+          {[
+            { id: 'home', icon: Timer, label: '行动' },
+            { id: 'shop', icon: Coffee, label: '休息' },
+            { id: 'calendar', icon: Calendar, label: '成就' }
+          ].map(btn => (
+            <button key={btn.id} onClick={() => setActiveTab(btn.id)} className={`flex flex-col items-center gap-0.5 transition-all ${activeTab === btn.id ? 'text-orange-500 scale-110' : 'text-gray-300'}`}>
+              <btn.icon size={22} strokeWidth={activeTab === btn.id ? 3 : 2} />
+              <span className="text-[8px] font-black uppercase tracking-tighter">{btn.label}</span>
+            </button>
+          ))}
+        </nav>
+
+        {/* 调试按钮 */}
+        <button onClick={() => setShowDebugMenu(true)} className="absolute bottom-24 right-6 w-10 h-10 bg-gray-800/10 text-gray-400 rounded-xl flex items-center justify-center z-30"><Box size={16} /></button>
+        {showDebugMenu && (
+          <div className="fixed inset-0 bg-black/70 z-[400] flex items-center justify-center p-6" onClick={() => setShowDebugMenu(false)}>
+            <div className="bg-gray-900 w-full max-w-xs rounded-[40px] p-8 space-y-3 border border-gray-700" onClick={e => e.stopPropagation()}>
+              <h4 className="text-white font-black text-center mb-4 flex items-center justify-center gap-2"><Wrench size={16} /> 调试</h4>
+              <button onClick={() => {setInventory({...inventory, LARGE: inventory.LARGE + 10}); setShowDebugMenu(false);}} className="w-full py-3 bg-gray-800 text-white rounded-xl text-xs font-bold border border-gray-700">+10 大番茄</button>
+              <button onClick={() => {debugTools.mockAction(); setShowDebugMenu(false);}} className="w-full py-3 bg-blue-600 text-white rounded-xl text-xs font-bold">模拟打卡 (15m)</button>
+              <button onClick={() => {debugTools.skipToEnd(); setShowDebugMenu(false);}} className="w-full py-3 bg-yellow-600 text-white rounded-xl text-xs font-bold">跳转最后1s</button>
+              <button onClick={() => {debugTools.jumpDay(); setShowDebugMenu(false);}} className="w-full py-3 bg-green-600 text-white rounded-xl text-xs font-bold">跨越零点</button>
+              <button onClick={() => setShowDebugMenu(false)} className="w-full py-3 text-gray-500 text-[10px] font-bold text-center mt-4">关闭菜单</button>
+            </div>
+          </div>
+        )}
+
+        {/* 温馨闹钟 */}
+        {alarmActive && (
+          <div className="fixed inset-0 bg-white/98 z-[500] flex flex-col items-center justify-center p-8 animate-in fade-in duration-500 overflow-hidden">
+            <div className="absolute top-0 left-0 w-full h-1.5 bg-orange-100">
+              <div className="h-full bg-orange-500 transition-all duration-1000" style={{ width: `${(alarmAutoStopTimer/30)*100}%` }}></div>
+            </div>
+            
+            <div className="relative mb-12">
+              <div className="w-40 h-40 bg-orange-50 rounded-[50px] flex items-center justify-center animate-bounce shadow-inner">
+                <Bell size={80} className="text-orange-500" />
+              </div>
+              <div className="absolute -top-4 -right-4 bg-yellow-400 w-12 h-12 rounded-full flex items-center justify-center border-4 border-white animate-spin">
+                <Star size={24} className="text-white fill-current" />
+              </div>
+            </div>
+
+            <h2 className="text-4xl font-black text-orange-900 mb-2">
+              {timerState.mode === 'work' ? '专注完成！' : '休息结束！'}
+            </h2>
+            <p className="text-gray-400 font-bold mb-16 text-center leading-relaxed">
+              {timerState.mode === 'work' 
+                ? '太棒了 bro，你离目标更近了一步 🐻' 
+                : '休息好啦，快打起精神继续冲刺吧 ✨'}
+            </p>
+            
+            <button 
+              onClick={() => { setAlarmActive(false); stopMelody(); }}
+              className="w-full max-w-xs py-6 bg-orange-500 text-white rounded-[30px] font-black text-xl shadow-2xl shadow-orange-200 active:scale-95 transition flex items-center justify-center gap-3"
+            >
+              <Check size={24} /> 我知道了
+            </button>
+            
+            <p className="mt-8 text-[10px] text-gray-300 font-bold uppercase tracking-widest">
+              闹钟将在 {alarmAutoStopTimer} 秒后自动停止
+            </p>
+          </div>
+        )}
+
+        {/* 准备遮罩 */}
+        {isPreparing && (
+          <div className="fixed inset-0 bg-orange-500 z-[100] flex flex-col items-center justify-center text-white">
+            <div className="text-[180px] font-black leading-none animate-pulse drop-shadow-2xl">{prepCount}</div>
+            <div className="mt-4 font-black text-orange-100 tracking-[0.3em] uppercase text-sm">Get Focus...</div>
+          </div>
+        )}
+
+        {/* 确认 Modal */}
+        {confirmModal.show && (
+          <div className="fixed inset-0 bg-black/60 z-[200] flex items-center justify-center p-6">
+            <div className="bg-white rounded-[40px] p-8 w-full max-w-xs text-center border-b-[12px] border-orange-100">
+              <div className="w-20 h-20 bg-orange-50 text-orange-500 rounded-3xl flex items-center justify-center mx-auto mb-6">
+                {confirmModal.type === 'WORK' ? <Timer size={40} /> : <Coffee size={40} />}
+              </div>
+              <h3 className="text-xl font-black mb-3 text-orange-800">{confirmModal.type === 'WORK' ? '开启深度专注' : '使用番茄休息'}</h3>
+              <p className="text-xs text-gray-400 mb-10 leading-relaxed font-bold px-4">
+                {confirmModal.type === 'WORK' 
+                  ? `你即将开始「${confirmModal.data.name}」，时长 ${confirmModal.data.duration} 分钟。`
+                  : confirmModal.type === 'REST_POOL' 
+                  ? "进入自由休息室将开启结算模式，结束后按秒抵扣番茄。"
+                  : `将消耗 1 个${TOMATO_TYPES[confirmModal.data].label}进行 ${TOMATO_TYPES[confirmModal.data].duration} 分钟休息。`
+                }
+              </p>
+              <div className="flex gap-4">
+                <button onClick={() => setConfirmModal({show:false})} className="flex-1 py-4 text-gray-300 font-black">取消</button>
+                <button onClick={confirmStart} className="flex-1 py-4 bg-orange-500 text-white rounded-2xl font-black shadow-lg">确定</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 新增 Modal */}
+        {showAddModal && (
+          <div className="fixed inset-0 bg-black/40 z-[150] flex items-end">
+            <div className="bg-white w-full rounded-t-[50px] p-10 pb-14 animate-in slide-in-from-bottom duration-300">
+              <div className="w-12 h-1 bg-gray-100 rounded-full mx-auto mb-8"></div>
+              <h3 className="text-2xl font-black mb-8 text-orange-800">规划新的行动</h3>
+              <div className="space-y-6">
+                <input type="text" value={newBlock.name} onChange={e => setNewBlock({...newBlock, name: e.target.value})} className="w-full bg-gray-50 p-5 rounded-[24px] outline-none font-black text-gray-700 border-2 border-transparent focus:border-orange-200 transition text-lg" placeholder="任务名称..." />
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="bg-gray-50 p-5 rounded-[24px]">
+                    <label className="text-[10px] text-gray-400 font-black uppercase mb-2 block tracking-widest">时长 (min)</label>
+                    <input type="number" value={newBlock.duration} onChange={e => setNewBlock({...newBlock, duration: parseInt(e.target.value) || 0})} className="bg-transparent w-full font-black text-3xl outline-none text-orange-800" />
+                  </div>
+                  <div className="bg-gray-50 p-5 rounded-[24px] text-center">
+                    <label className="text-[10px] text-gray-400 font-black uppercase mb-2 block tracking-widest">图标</label>
+                    <select value={newBlock.icon} onChange={e => setNewBlock({...newBlock, icon: e.target.value})} className="bg-transparent font-black text-3xl outline-none cursor-pointer">
+                      <option>🏃</option><option>🎨</option><option>📖</option><option>🧹</option><option>🧘</option><option>🎹</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  {['SMALL', 'MEDIUM', 'LARGE'].map(t => (
+                    <button key={t} onClick={() => setNewBlock({...newBlock, reward: t})} className={`flex-1 py-4 rounded-2xl text-[10px] font-black border-2 transition ${newBlock.reward === t ? 'bg-orange-500 border-orange-500 text-white' : 'bg-white border-gray-100 text-gray-400'}`}>{TOMATO_TYPES[t].label}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="flex gap-4 mt-12">
+                <button onClick={() => setShowAddModal(false)} className="flex-1 py-5 text-gray-400 font-black">取消</button>
+                <button onClick={() => { if(!newBlock.name) return; setBlocks([...blocks, { ...newBlock, id: Date.now().toString() }]); setShowAddModal(false); }} className="flex-[2] py-5 bg-orange-500 text-white rounded-[24px] font-black shadow-xl">确认创建</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+};
+
+export default App;
